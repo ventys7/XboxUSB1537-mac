@@ -1,0 +1,11 @@
+# Compiled binaries
+xbox1537_libusb
+xbox1537_iokit
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Python
+__pycache__/
+*.pyc

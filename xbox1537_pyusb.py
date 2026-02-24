@@ -8,10 +8,17 @@ Cosa fa:
 3) invia handshake candidati
 4) legge i report raw in loop
 5) decodifica campi comuni (buttons/triggers/sticks)
+
+Compatibilità macOS:
+- detach_kernel_driver non è supportato da libusb su macOS;
+  il codice gestisce il fallimento e continua.
+- Se claim_interface fallisce, provare con sudo oppure
+  usare unload_xbox_kext.sh per liberare il device.
 """
 
 from __future__ import annotations
 
+import platform
 import struct
 import sys
 import time
@@ -19,6 +26,8 @@ from typing import Dict, List, Optional, Tuple
 
 import usb.core
 import usb.util
+
+IS_MACOS = platform.system() == "Darwin"
 
 VID = 0x045E
 PID = 0x02D1
@@ -116,17 +125,37 @@ def main() -> int:
 
     print(f"Trovato device {VID:04x}:{PID:04x}")
 
-    if dev.is_kernel_driver_active(0):
-        try:
-            dev.detach_kernel_driver(0)
-            print("Detached kernel driver da interfaccia 0")
-        except usb.core.USBError as exc:
-            print(f"Impossibile detach kernel driver: {exc}")
+    # --- Detach kernel driver (non supportato su macOS) ---
+    try:
+        if dev.is_kernel_driver_active(0):
+            try:
+                dev.detach_kernel_driver(0)
+                print("Detached kernel driver da interfaccia 0")
+            except usb.core.USBError as exc:
+                if IS_MACOS:
+                    print(f"[macOS] detach_kernel_driver non supportato (normale): {exc}")
+                else:
+                    print(f"Impossibile detach kernel driver: {exc}")
+    except NotImplementedError:
+        if IS_MACOS:
+            print("[macOS] is_kernel_driver_active non supportato, continuiamo...")
+        else:
+            raise
 
     dev.set_configuration()
     interface_number, ep_in, ep_out = find_interrupt_endpoints(dev)
 
-    usb.util.claim_interface(dev, interface_number)
+    try:
+        usb.util.claim_interface(dev, interface_number)
+    except usb.core.USBError as exc:
+        if IS_MACOS:
+            print(f"\n[macOS] claim_interface fallito: {exc}")
+            print("Probabili soluzioni:")
+            print("  1) Esegui con sudo:  sudo python3 xbox1537_pyusb.py")
+            print("  2) Scarica il kext:  sudo ./unload_xbox_kext.sh")
+            print("  3) Usa la versione IOKit nativa: ./xbox1537_iokit")
+            return 1
+        raise
     print(f"Interfaccia={interface_number}, EP_IN=0x{ep_in:02x}, EP_OUT=0x{ep_out:02x}")
 
     try:

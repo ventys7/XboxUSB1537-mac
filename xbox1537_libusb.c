@@ -171,16 +171,42 @@ int main(void) {
 
   printf("Interfaccia=%d EP_IN=0x%02x EP_OUT=0x%02x\n", iface, ep_in, ep_out);
 
-  if (libusb_kernel_driver_active(handle, iface) == 1) {
+  rc = libusb_kernel_driver_active(handle, iface);
+  if (rc == 1) {
     rc = libusb_detach_kernel_driver(handle, iface);
-    if (rc != 0) {
+    if (rc == 0) {
+      printf("Detached kernel driver da interfaccia %d\n", iface);
+    } else {
+#ifdef __APPLE__
+      fprintf(stderr,
+              "[macOS] detach_kernel_driver non supportato (rc=%d), "
+              "continuiamo...\n",
+              rc);
+#else
       fprintf(stderr, "detach kernel driver fallito: %d\n", rc);
+#endif
     }
   }
+#ifdef __APPLE__
+  else if (rc == LIBUSB_ERROR_NOT_SUPPORTED) {
+    fprintf(stderr,
+            "[macOS] kernel_driver_active non supportato, continuiamo...\n");
+  }
+#endif
 
   rc = libusb_claim_interface(handle, iface);
   if (rc != 0) {
+#ifdef __APPLE__
+    fprintf(stderr,
+            "\n[macOS] claim_interface fallito: %d\n"
+            "Probabili soluzioni:\n"
+            "  1) Esegui con sudo:  sudo ./xbox1537_libusb\n"
+            "  2) Scarica il kext:  sudo ./unload_xbox_kext.sh\n"
+            "  3) Usa la versione IOKit nativa: ./xbox1537_iokit\n",
+            rc);
+#else
     fprintf(stderr, "claim_interface fallito: %d\n", rc);
+#endif
     libusb_close(handle);
     libusb_exit(ctx);
     return 1;

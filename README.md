@@ -1,13 +1,43 @@
-# Xbox One Controller 1537 (USB 045e:02d1) raw input con libusb/PyUSB
+# Xbox One Controller 1537 (USB 045e:02d1) raw input con libusb/PyUSB/IOKit
 
-Questa repository contiene due esempi minimi per comunicare con un controller Xbox One modello **1537** via USB:
+Questa repository contiene tre implementazioni per comunicare con un controller Xbox One modello **1537** via USB:
 
-- `xbox1537_pyusb.py` (Python + PyUSB)
-- `xbox1537_libusb.c` (C + libusb-1.0)
+- `xbox1537_pyusb.py` (Python + PyUSB) — cross-platform
+- `xbox1537_libusb.c` (C + libusb-1.0) — cross-platform
+- `xbox1537_iokit.m` (Objective-C + IOKit) — **macOS nativo**, nessuna dipendenza esterna
 
 > Nota: il protocollo non è HID standard; i pacchetti sono in stile GIP/XUSB e il contenuto può variare con firmware e revisione.
 
 ## 1) Prerequisiti
+
+### macOS
+
+**Opzione A — IOKit nativo (consigliata)**
+
+Non serve installare nulla. Compila direttamente:
+
+```bash
+clang -O2 -Wall -framework IOKit -framework CoreFoundation \
+      xbox1537_iokit.m -o xbox1537_iokit
+```
+
+**Opzione B — libusb/PyUSB**
+
+Richiede [Homebrew](https://brew.sh):
+
+```bash
+brew install libusb
+python3 -m pip install pyusb
+```
+
+Compilazione C:
+
+```bash
+gcc -O2 -Wall -Wextra xbox1537_libusb.c -o xbox1537_libusb \
+    $(pkg-config --cflags --libs libusb-1.0)
+```
+
+> ⚠️ **Su macOS libusb/PyUSB hanno un problema noto:** il sistema carica automaticamente un driver kernel che blocca l'accesso USB al controller. Vedi la sezione [Troubleshooting macOS](#7-troubleshooting-macos) per le soluzioni.
 
 ### Linux
 
@@ -103,43 +133,60 @@ Mappatura bit pulsanti usata negli esempi:
 
 ## 6) Debug pratico
 
-- Se `claim_interface` fallisce, stacca eventuale driver kernel (`detach_kernel_driver`) o usa root.
+- Se `claim_interface` fallisce su macOS, vedi sezione sotto.
+- Se `claim_interface` fallisce su Linux, stacca eventuale driver kernel (`detach_kernel_driver`) o usa root.
 - Se timeout di lettura:
   - verifica endpoint corretto,
   - verifica handshake,
   - prova timeout più alto (es. 1000 ms).
 - Se ricevi frame ma decode errato, logga hex completo e ricalibra gli offset.
 
+## 7) Troubleshooting macOS
 
-## 7) Pubblicazione su GitHub
+Su macOS il sistema carica automaticamente un driver kernel (es. `AppleUSBHIDDriver`) che "reclama" il controller Xbox, impedendo a libusb/PyUSB di accedere al device.
 
-In questa environment non è configurato un remote GitHub di default. Per pubblicare i file:
+### Soluzione 1 — Usare la versione IOKit nativa (consigliata)
+
+L'implementazione `xbox1537_iokit.m` usa le API native Apple e bypassa completamente il problema:
+
+```bash
+clang -O2 -Wall -framework IOKit -framework CoreFoundation \
+      xbox1537_iokit.m -o xbox1537_iokit
+./xbox1537_iokit
+# oppure: sudo ./xbox1537_iokit
+```
+
+Usa `USBDeviceOpenSeize` per prendere il controllo del device anche se un driver kernel lo ha già reclamato.
+
+### Soluzione 2 — Eseguire con sudo
+
+```bash
+sudo python3 xbox1537_pyusb.py
+sudo ./xbox1537_libusb
+```
+
+### Soluzione 3 — Scaricare il kext manualmente
+
+Usa lo script incluso per identificare e scaricare il driver kernel:
+
+```bash
+sudo ./unload_xbox_kext.sh
+# poi esegui normalmente:
+./xbox1537_libusb
+python3 xbox1537_pyusb.py
+```
+
+> ⚠️ I kext vengono ricaricati al reboot o quando ricolleghi il controller.
+
+## 8) Pubblicazione su GitHub
 
 ```bash
 git remote add origin https://github.com/<tuo-utente>/<tuo-repo>.git
-git push -u origin work
+git push -u origin main
 ```
-
-Se il repository è privato, usa autenticazione via token (PAT) o SSH key.
-
-Verifica finale:
-
-```bash
-git remote -v
-git log --oneline -n 3
-```
-
 
 ### Script rapido (opzionale)
 
-Per evitare errori manuali puoi usare lo script incluso:
-
 ```bash
 GITHUB_REPO="https://github.com/<tuo-utente>/<tuo-repo>.git" ./publish_to_github.sh
-```
-
-Opzioni:
-
-```bash
-REMOTE_NAME=origin BRANCH=work GITHUB_REPO="https://github.com/<tuo-utente>/<tuo-repo>.git" ./publish_to_github.sh
 ```

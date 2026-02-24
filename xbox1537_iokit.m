@@ -1,42 +1,40 @@
 /*
- * xbox1537_iokit.m — Accesso diretto IOKit per Xbox One Controller 1537.
+ * xbox1537_iokit.m — Lettura input Xbox One Controller 1537 su macOS.
  *
- * Usa le API native macOS (IOKit USB) per comunicare col controller
- * SENZA libusb, bypassando i conflitti con i driver kernel.
+ * Usa IOHIDManager per leggere i report HID dal controller,
+ * lavorando CON il driver Apple (non contro di esso).
+ *
+ * Su macOS 15+ (Sequoia) il controller Xbox One è supportato nativamente
+ * e appare come IOHIDDevice con UsagePage=1 (Generic Desktop).
  *
  * Build:
  *   clang -O2 -Wall -framework IOKit -framework CoreFoundation \
  *         xbox1537_iokit.m -o xbox1537_iokit
  *
  * Run:
- *   ./xbox1537_iokit          (potrebbe servire sudo)
+ *   ./xbox1537_iokit          (non serve sudo)
  */
 
 #import <CoreFoundation/CoreFoundation.h>
-#import <IOKit/IOCFPlugIn.h>
-#import <IOKit/IOKitLib.h>
-#import <IOKit/usb/IOUSBLib.h>
+#import <IOKit/hid/IOHIDManager.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #define VID 0x045E
 #define PID 0x02D1
-#define READ_TIMEOUT_MS 500
-#define BUF_SIZE 64
 
 static volatile sig_atomic_t g_running = 1;
 
 static void sigint_handler(int sig) {
   (void)sig;
   g_running = 0;
+  /* Ferma il RunLoop per uscire subito */
+  CFRunLoopStop(CFRunLoopGetMain());
 }
 
-static const uint8_t HANDSHAKE_1[] = {0x05, 0x20, 0x00, 0x01, 0x00};
-static const uint8_t HANDSHAKE_2[] = {0x01, 0x20};
-static const uint8_t HANDSHAKE_3[] = {0x05, 0x20, 0x01, 0x00, 0x00};
+/* ---------- Decodifica report ---------- */
 
 static const char *button_name(unsigned bit) {
   switch (bit) {
@@ -75,29 +73,26 @@ static const char *button_name(unsigned bit) {
   }
 }
 
-static int16_t read_i16le(const uint8_t *p) {
-  return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
-static void dump_hex(const uint8_t *buf, int len) {
-  printf("RAW[%02d]:", len);
-  for (int i = 0; i < len; i++) {
+static void dump_hex(const uint8_t *buf, CFIndex len) {
+  printf("RAW[%02ld]:", (long)len);
+  for (CFIndex i = 0; i < len; i++) {
     printf(" %02x", buf[i]);
   }
   printf("\n");
 }
 
-static void decode_and_print(const uint8_t *buf, int len) {
+static void decode_gip_report(const uint8_t *buf, CFIndex len) {
+  /* Report GIP tipico: almeno 16 byte, tipo 0x20 */
   if (len < 16)
     return;
 
   uint16_t buttons = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
   uint8_t lt = buf[6];
   uint8_t rt = buf[7];
-  int16_t lx = read_i16le(&buf[8]);
-  int16_t ly = read_i16le(&buf[10]);
-  int16_t rx = read_i16le(&buf[12]);
-  int16_t ry = read_i16le(&buf[14]);
+  int16_t lx = (int16_t)((uint16_t)buf[8] | ((uint16_t)buf[9] << 8));
+  int16_t ly = (int16_t)((uint16_t)buf[10] | ((uint16_t)buf[11] << 8));
+  int16_t rx = (int16_t)((uint16_t)buf[12] | ((uint16_t)buf[13] << 8));
+  int16_t ry = (int16_t)((uint16_t)buf[14] | ((uint16_t)buf[15] << 8));
 
   printf("DECODE: btn=0x%04x pressed=[", buttons);
   int first = 1;
@@ -115,215 +110,184 @@ static void decode_and_print(const uint8_t *buf, int len) {
   printf("] LT=%u RT=%u LX=%d LY=%d RX=%d RY=%d\n", lt, rt, lx, ly, rx, ry);
 }
 
-/*
- * Trova e apre l'interfaccia USB con endpoint interrupt IN/OUT.
- * Ritorna 0 se trovata, -1 altrimenti.
- */
-static int find_and_open_interface(IOUSBDeviceInterface **dev,
-                                   IOUSBInterfaceInterface **intf[],
-                                   uint8_t *ep_in, uint8_t *ep_out) {
-  IOUSBFindInterfaceRequest req;
-  req.bInterfaceClass = kIOUSBFindInterfaceDontCare;
-  req.bInterfaceSubClass = kIOUSBFindInterfaceDontCare;
-  req.bInterfaceProtocol = kIOUSBFindInterfaceDontCare;
-  req.bAlternateSetting = kIOUSBFindInterfaceDontCare;
+/* ---------- Callback HID ---------- */
 
-  io_iterator_t iter;
-  kern_return_t kr = (*dev)->CreateInterfaceIterator(dev, &req, &iter);
-  if (kr != KERN_SUCCESS) {
-    fprintf(stderr, "CreateInterfaceIterator fallito: 0x%x\n", kr);
-    return -1;
-  }
+static void input_report_callback(void *context, IOReturn result, void *sender,
+                                  IOHIDReportType type, uint32_t reportID,
+                                  uint8_t *report, CFIndex reportLength) {
+  (void)context;
+  (void)result;
+  (void)sender;
+  (void)type;
+  (void)reportID;
 
-  io_service_t usbInterfaceRef;
-  while ((usbInterfaceRef = IOIteratorNext(iter)) != 0) {
-    IOCFPlugInInterface **plugIn = NULL;
-    SInt32 score;
-    kr = IOCreatePlugInInterfaceForService(
-        usbInterfaceRef, kIOUSBInterfaceUserClientTypeID,
-        kIOCFPlugInInterfaceID, &plugIn, &score);
-    IOObjectRelease(usbInterfaceRef);
-
-    if (kr != KERN_SUCCESS || plugIn == NULL)
-      continue;
-
-    HRESULT res = (*plugIn)->QueryInterface(
-        plugIn, CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID), (LPVOID *)intf);
-    (*plugIn)->Release(plugIn);
-
-    if (res != S_OK || *intf == NULL)
-      continue;
-
-    kr = (**intf)->USBInterfaceOpen(*intf);
-    if (kr != KERN_SUCCESS) {
-      fprintf(stderr, "USBInterfaceOpen fallito: 0x%x\n", kr);
-      (**intf)->Release(*intf);
-      *intf = NULL;
-      continue;
-    }
-
-    /* Cerca endpoint interrupt IN e OUT */
-    uint8_t numEP;
-    (**intf)->GetNumEndpoints(*intf, &numEP);
-    uint8_t in_addr = 0, out_addr = 0;
-
-    for (uint8_t i = 1; i <= numEP; i++) {
-      uint8_t direction, number, transferType, interval;
-      uint16_t maxPacketSize;
-      (**intf)->GetPipeProperties(*intf, i, &direction, &number, &transferType,
-                                  &maxPacketSize, &interval);
-      if (transferType != kUSBInterrupt)
-        continue;
-      if (direction == kUSBIn && in_addr == 0)
-        in_addr = i;
-      else if (direction == kUSBOut && out_addr == 0)
-        out_addr = i;
-    }
-
-    if (in_addr && out_addr) {
-      *ep_in = in_addr;
-      *ep_out = out_addr;
-      IOObjectRelease(iter);
-      return 0;
-    }
-
-    (**intf)->USBInterfaceClose(*intf);
-    (**intf)->Release(*intf);
-    *intf = NULL;
-  }
-
-  IOObjectRelease(iter);
-  return -1;
+  dump_hex(report, reportLength);
+  decode_gip_report(report, reportLength);
 }
+
+static void input_value_callback(void *context, IOReturn result, void *sender,
+                                 IOHIDValueRef value) {
+  (void)context;
+  (void)result;
+  (void)sender;
+
+  IOHIDElementRef element = IOHIDValueGetElement(value);
+  uint32_t usagePage = IOHIDElementGetUsagePage(element);
+  uint32_t usage = IOHIDElementGetUsage(element);
+  CFIndex intValue = IOHIDValueGetIntegerValue(value);
+
+  /* Filtra: stampa solo valori non-zero o assi principali */
+  if (usagePage == 0x01) {
+    /* Generic Desktop: stick e hat switch */
+    const char *axisName = "?";
+    switch (usage) {
+    case 0x30:
+      axisName = "LX";
+      break;
+    case 0x31:
+      axisName = "LY";
+      break;
+    case 0x32:
+      axisName = "RX";
+      break;
+    case 0x33:
+      axisName = "Z (LT?)";
+      break;
+    case 0x34:
+      axisName = "Rz (RT?)";
+      break;
+    case 0x35:
+      axisName = "RY";
+      break;
+    case 0x39:
+      axisName = "HAT";
+      break;
+    default:
+      axisName = "axis";
+      break;
+    }
+    printf("AXIS: %s (page=0x%02x usage=0x%02x) = %ld\n", axisName, usagePage,
+           usage, (long)intValue);
+  } else if (usagePage == 0x09) {
+    /* Button page */
+    if (intValue != 0) {
+      printf("BUTTON: #%u PRESSED (value=%ld)\n", usage, (long)intValue);
+    } else {
+      printf("BUTTON: #%u released\n", usage);
+    }
+  } else if (intValue != 0) {
+    printf("HID: page=0x%02x usage=0x%02x value=%ld\n", usagePage, usage,
+           (long)intValue);
+  }
+}
+
+static void device_matched_callback(void *context, IOReturn result,
+                                    void *sender, IOHIDDeviceRef device) {
+  (void)context;
+  (void)result;
+  (void)sender;
+
+  CFStringRef product = IOHIDDeviceGetProperty(device, CFSTR(kIOHIDProductKey));
+  if (product) {
+    char buf[256];
+    CFStringGetCString(product, buf, sizeof(buf), kCFStringEncodingUTF8);
+    printf("✅ Controller connesso: %s\n", buf);
+  } else {
+    printf("✅ Controller connesso (nome non disponibile)\n");
+  }
+
+  /* Registra callback per report raw */
+  static uint8_t reportBuf[256];
+  IOHIDDeviceRegisterInputReportCallback(device, reportBuf, sizeof(reportBuf),
+                                         input_report_callback, NULL);
+
+  /* Registra callback per valori HID parsed */
+  IOHIDDeviceRegisterInputValueCallback(device, input_value_callback, NULL);
+
+  printf("Lettura input... (CTRL+C per uscire)\n\n");
+}
+
+static void device_removed_callback(void *context, IOReturn result,
+                                    void *sender, IOHIDDeviceRef device) {
+  (void)context;
+  (void)result;
+  (void)sender;
+  (void)device;
+  printf("⚠️  Controller scollegato\n");
+}
+
+/* ---------- Main ---------- */
 
 int main(void) {
   signal(SIGINT, sigint_handler);
 
-  /* Matching dictionary per VID/PID */
-  CFMutableDictionaryRef matchDict = IOServiceMatching(kIOUSBDeviceClassName);
-  if (!matchDict) {
-    fprintf(stderr, "IOServiceMatching fallito\n");
+  IOHIDManagerRef manager =
+      IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+  if (!manager) {
+    fprintf(stderr, "IOHIDManagerCreate fallito\n");
     return 1;
   }
 
-  CFDictionarySetValue(
-      matchDict, CFSTR(kUSBVendorID),
-      CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &(int){VID}));
-  CFDictionarySetValue(
-      matchDict, CFSTR(kUSBProductID),
-      CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &(int){PID}));
+  /* Matching per VID/PID Xbox One 1537 */
+  CFMutableDictionaryRef matchDict = CFDictionaryCreateMutable(
+      kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+      &kCFTypeDictionaryValueCallBacks);
 
-  io_service_t usbDevice =
-      IOServiceGetMatchingService(kIOMainPortDefault, matchDict);
-  if (!usbDevice) {
-    fprintf(stderr, "Device %04x:%04x non trovato\n", VID, PID);
-    return 1;
-  }
+  int vid = VID, pid = PID;
+  CFNumberRef vidNum =
+      CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vid);
+  CFNumberRef pidNum =
+      CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pid);
 
-  printf("Trovato device %04x:%04x nella IORegistry\n", VID, PID);
+  CFDictionarySetValue(matchDict, CFSTR(kIOHIDVendorIDKey), vidNum);
+  CFDictionarySetValue(matchDict, CFSTR(kIOHIDProductIDKey), pidNum);
 
-  /* Creare plugin e interfaccia device */
-  IOCFPlugInInterface **plugIn = NULL;
-  SInt32 score;
-  kern_return_t kr = IOCreatePlugInInterfaceForService(
-      usbDevice, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID, &plugIn,
-      &score);
-  IOObjectRelease(usbDevice);
+  CFRelease(vidNum);
+  CFRelease(pidNum);
 
-  if (kr != KERN_SUCCESS || plugIn == NULL) {
-    fprintf(stderr, "IOCreatePlugInInterfaceForService fallito: 0x%x\n", kr);
-    return 1;
-  }
+  IOHIDManagerSetDeviceMatching(manager, matchDict);
+  CFRelease(matchDict);
 
-  IOUSBDeviceInterface **dev = NULL;
-  HRESULT res = (*plugIn)->QueryInterface(
-      plugIn, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID), (LPVOID *)&dev);
-  (*plugIn)->Release(plugIn);
+  /* Registra callback connect/disconnect */
+  IOHIDManagerRegisterDeviceMatchingCallback(manager, device_matched_callback,
+                                             NULL);
+  IOHIDManagerRegisterDeviceRemovalCallback(manager, device_removed_callback,
+                                            NULL);
 
-  if (res != S_OK || dev == NULL) {
-    fprintf(stderr, "QueryInterface device fallito\n");
-    return 1;
-  }
+  /* Apri il manager */
+  IOReturn ret = IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone);
+  if (ret != kIOReturnSuccess) {
+    fprintf(stderr, "IOHIDManagerOpen fallito: 0x%x\n", ret);
 
-  /* Aprire il device — seize=true per prendere il controllo dal driver kernel
-   */
-  kr = (*dev)->USBDeviceOpenSeize(dev);
-  if (kr != KERN_SUCCESS) {
-    fprintf(stderr,
-            "USBDeviceOpenSeize fallito: 0x%x\n"
-            "Il device potrebbe essere bloccato da un altro processo.\n"
-            "Prova con: sudo ./xbox1537_iokit\n",
-            kr);
-    (*dev)->Release(dev);
-    return 1;
-  }
-
-  printf("Device aperto con successo (seize mode)\n");
-
-  /* Configurazione */
-  IOUSBConfigurationDescriptorPtr configDesc;
-  kr = (*dev)->GetConfigurationDescriptorPtr(dev, 0, &configDesc);
-  if (kr == KERN_SUCCESS) {
-    kr = (*dev)->SetConfiguration(dev, configDesc->bConfigurationValue);
-    if (kr != KERN_SUCCESS) {
-      fprintf(stderr, "SetConfiguration fallito: 0x%x\n", kr);
+    /* Prova con seize */
+    printf("Tentativo con kIOHIDOptionsTypeSeizeDevice...\n");
+    ret = IOHIDManagerOpen(manager, kIOHIDOptionsTypeSeizeDevice);
+    if (ret != kIOReturnSuccess) {
+      fprintf(stderr, "Anche seize fallito: 0x%x\n", ret);
+      fprintf(stderr, "Prova con: sudo ./xbox1537_iokit\n");
+      CFRelease(manager);
+      return 1;
     }
   }
 
-  /* Trovare e aprire interfaccia con endpoint interrupt */
-  IOUSBInterfaceInterface **intf = NULL;
-  uint8_t ep_in = 0, ep_out = 0;
+  /* Schedula nel RunLoop */
+  IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(),
+                                  kCFRunLoopDefaultMode);
 
-  if (find_and_open_interface(dev, &intf, &ep_in, &ep_out) != 0) {
-    fprintf(stderr, "Nessuna interfaccia con endpoint interrupt IN/OUT\n");
-    (*dev)->USBDeviceClose(dev);
-    (*dev)->Release(dev);
-    return 1;
-  }
+  printf("Xbox One Controller 1537 — IOHIDManager\n");
+  printf("In attesa del controller (VID=%04x PID=%04x)...\n", VID, PID);
+  printf("Se già collegato, dovrebbe apparire subito.\n\n");
 
-  printf("Interfaccia aperta, EP_IN=pipe %d, EP_OUT=pipe %d\n", ep_in, ep_out);
-
-  /* Inviare handshake */
-  const uint8_t *frames[] = {HANDSHAKE_1, HANDSHAKE_2, HANDSHAKE_3};
-  const uint32_t lengths[] = {sizeof(HANDSHAKE_1), sizeof(HANDSHAKE_2),
-                              sizeof(HANDSHAKE_3)};
-
-  for (int i = 0; i < 3; i++) {
-    kr = (*intf)->WritePipe(intf, ep_out, (void *)frames[i], lengths[i]);
-    printf("Handshake %d rc=0x%x\n", i + 1, kr);
-    usleep(20000);
-  }
-
-  /* Loop di lettura */
-  printf("Lettura input... (CTRL+C per uscire)\n");
+  /* RunLoop — esce con CTRL+C */
   while (g_running) {
-    uint8_t buf[BUF_SIZE];
-    uint32_t bytesRead = BUF_SIZE;
-
-    kr = (*intf)->ReadPipeTO(intf, ep_in, buf, &bytesRead, READ_TIMEOUT_MS,
-                             READ_TIMEOUT_MS);
-
-    if (kr == kIOUSBTransactionTimeout) {
-      continue;
-    }
-    if (kr != KERN_SUCCESS) {
-      /* Prova senza timeout se ReadPipeTO non è supportato */
-      kr = (*intf)->ReadPipe(intf, ep_in, buf, &bytesRead);
-      if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "ReadPipe fallito: 0x%x\n", kr);
-        break;
-      }
-    }
-
-    dump_hex(buf, (int)bytesRead);
-    decode_and_print(buf, (int)bytesRead);
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
   }
 
   printf("\nChiusura...\n");
-  (*intf)->USBInterfaceClose(intf);
-  (*intf)->Release(intf);
-  (*dev)->USBDeviceClose(dev);
-  (*dev)->Release(dev);
+  IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetCurrent(),
+                                    kCFRunLoopDefaultMode);
+  IOHIDManagerClose(manager, kIOHIDOptionsTypeNone);
+  CFRelease(manager);
 
   return 0;
 }
